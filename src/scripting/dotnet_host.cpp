@@ -39,7 +39,10 @@
 #endif
 
 #include <cassert>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <vector>
 
 #include "core/log.h"
 #include "core/utils.h"
@@ -90,6 +93,57 @@ void* get_export(void* h, const char* name)
     assert(f != nullptr);
     return f;
 }
+
+// The .NET runtime's native libraries (hostfxr/hostpolicy/coreclr/clrjit/clrgc) resolve their C++
+// operator new/delete through the dynamic linker. Inside CS2, libtier0.so exports the full set of
+// unversioned allocation operators (backed by its bundled jemalloc) and precedes libstdc++ in the
+// global lookup scope, so parts of the runtime end up allocating from one allocator (glibc malloc)
+// while releasing through the other (tier0 jemalloc). jemalloc then dereferences a NULL radix-tree
+// leaf for the foreign address, corrupting/crashing the server (observed as SIGSEGV in je_calloc).
+//
+// Preloading the runtime libraries with RTLD_DEEPBIND makes each of them resolve those symbols
+// against its own dependency tree (libstdc++ -> glibc) first, keeping allocate/release pairs on a
+// single allocator. hostfxr/hostpolicy later dlopen the same files and simply reuse the handles
+// (and therefore the symbol bindings) created here.
+void preload_runtime_libraries_deepbind(const std::string& base_dir)
+{
+    if (std::getenv("CSSHARP_DISABLE_DEEPBIND") != nullptr)
+    {
+        CSSHARP_CORE_INFO("Skipping .NET runtime deepbind preload (CSSHARP_DISABLE_DEEPBIND is set).");
+        return;
+    }
+
+    namespace fs = std::filesystem;
+    std::vector<fs::path> candidates;
+    std::error_code ec;
+
+    for (const auto& entry : fs::directory_iterator(base_dir + "/dotnet/host/fxr", ec))
+    {
+        candidates.push_back(entry.path() / "libhostfxr.so");
+    }
+
+    for (const auto& entry : fs::directory_iterator(base_dir + "/dotnet/shared/Microsoft.NETCore.App", ec))
+    {
+        for (const char* lib : { "libhostpolicy.so", "libcoreclr.so", "libclrjit.so", "libclrgc.so" })
+        {
+            candidates.push_back(entry.path() / lib);
+        }
+    }
+
+    for (const auto& path : candidates)
+    {
+        if (!fs::exists(path, ec)) continue;
+
+        if (dlopen(path.c_str(), RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND) != nullptr)
+        {
+            CSSHARP_CORE_INFO("Preloaded {0} with RTLD_DEEPBIND.", path.c_str());
+        }
+        else
+        {
+            CSSHARP_CORE_WARN("Failed to preload {0} with RTLD_DEEPBIND: {1}", path.c_str(), dlerror());
+        }
+    }
+}
 #endif
 
 // <SnippetLoadHostFxr>
@@ -102,6 +156,8 @@ bool load_hostfxr()
     std::wstring buffer = std::wstring(css::widen(base_dir) + L"\\dotnet\\host\\fxr\\10.0.3\\hostfxr.dll");
     CSSHARP_CORE_INFO("Loading hostfxr from {0}", css::narrow(buffer).c_str());
 #else
+    preload_runtime_libraries_deepbind(base_dir);
+
     std::string buffer = std::string(base_dir + "/dotnet/host/fxr/10.0.3/libhostfxr.so");
     CSSHARP_CORE_INFO("Loading hostfxr from {0}", buffer.c_str());
 #endif
