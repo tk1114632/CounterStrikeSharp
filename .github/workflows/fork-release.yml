@@ -1,0 +1,91 @@
+# Fork-only: manually build a full with-runtime linux package from any branch.
+name: Fork Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch / ref to build"
+        required: true
+        default: "fix/dotnet-tier0-allocator-mismatch"
+      version:
+        description: "Version stamp for assemblies & zip name"
+        required: true
+        default: "1.0.371"
+      runtime:
+        description: "aspnetcore runtime version to bundle (10.0.3 for net10 branches, 8.0.3 for net8 branch)"
+        required: true
+        default: "10.0.3"
+
+permissions: {}
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build_linux:
+    runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: "recursive"
+      - name: Build
+        run: |
+          mkdir -p build
+          cd build
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ..
+          cmake --build . --config ${{ env.BUILD_TYPE }} -- -j$(nproc)
+      - name: Collect
+        run: |
+          mkdir build/output
+          mv build/addons build/output
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ inputs.version }}
+          path: build/output/
+
+  build_managed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Publish
+        run: dotnet publish -c Release /p:Version=${{ inputs.version }} managed/CounterStrikeSharp.API
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-${{ inputs.version }}
+          path: managed/CounterStrikeSharp.API/bin/Release
+
+  package:
+    needs: ["build_linux", "build_managed"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-${{ inputs.version }}
+          path: build/linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: api-${{ inputs.version }}
+          path: build/api
+      - name: Assemble with-runtime package
+        run: |
+          mkdir -p build/linux/addons/counterstrikesharp/api
+          cp -r build/api/net*/publish/* build/linux/addons/counterstrikesharp/api
+          mkdir -p build/linux/addons/counterstrikesharp/dotnet
+          curl -s -L https://builds.dotnet.microsoft.com/dotnet/aspnetcore/Runtime/${{ inputs.runtime }}/aspnetcore-runtime-${{ inputs.runtime }}-linux-x64.tar.gz \
+            | tar xz -C build/linux/addons/counterstrikesharp/dotnet
+          (cd build/linux && zip -qq -r ../../counterstrikesharp-with-runtime-linux-${{ inputs.version }}.zip *)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: counterstrikesharp-with-runtime-linux-${{ inputs.version }}
+          path: counterstrikesharp-with-runtime-linux-*.zip
